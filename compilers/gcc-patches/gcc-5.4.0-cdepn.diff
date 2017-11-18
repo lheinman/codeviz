@@ -1,0 +1,204 @@
+diff -ruN gcc-5.4.0-clean/gcc/cgraph.c gcc-5.4.0-cdepn/gcc/cgraph.c
+--- gcc-5.4.0-clean/gcc/cgraph.c	2016-03-21 09:05:37.000000000 -0700
++++ gcc-5.4.0-cdepn/gcc/cgraph.c	2017-04-29 14:58:49.690735585 -0700
+@@ -822,7 +822,7 @@
+ cgraph_edge *
+ symbol_table::create_edge (cgraph_node *caller, cgraph_node *callee,
+ 			   gcall *call_stmt, gcov_type count, int freq,
+-			   bool indir_unknown_callee)
++			   bool indir_unknown_callee, location_t call_location)
+ {
+   cgraph_edge *edge;
+ 
+@@ -884,6 +884,7 @@
+ 
+   edge->indirect_info = NULL;
+   edge->indirect_inlining_edge = 0;
++  edge->call_location = call_location;
+   edge->speculative = false;
+   edge->indirect_unknown_callee = indir_unknown_callee;
+   if (opt_for_fn (edge->caller->decl, flag_devirtualize)
+@@ -906,7 +907,7 @@
+ 			  gcall *call_stmt, gcov_type count, int freq)
+ {
+   cgraph_edge *edge = symtab->create_edge (this, callee, call_stmt, count,
+-					   freq, false);
++					   freq, false, input_location);
+ 
+   initialize_inline_failed (edge);
+ 
+@@ -944,7 +945,7 @@
+ 				   bool compute_indirect_info)
+ {
+   cgraph_edge *edge = symtab->create_edge (this, NULL, call_stmt,
+-							    count, freq, true);
++							    count, freq, true, input_location);
+   tree target;
+ 
+   initialize_inline_failed (edge);
+diff -ruN gcc-5.4.0-clean/gcc/cgraph.h gcc-5.4.0-cdepn/gcc/cgraph.h
+--- gcc-5.4.0-clean/gcc/cgraph.h	2016-01-08 04:30:56.000000000 -0800
++++ gcc-5.4.0-cdepn/gcc/cgraph.h	2017-04-29 14:55:39.464055098 -0700
+@@ -1634,6 +1634,9 @@
+      type.  */
+   unsigned in_polymorphic_cdtor : 1;
+ 
++  /* CodeViz: Location the call occurred at */
++  location_t call_location;
++
+ private:
+   /* Remove the edge from the list of the callers of the callee.  */
+   void remove_caller (void);
+@@ -2137,7 +2140,7 @@
+      edge).  */
+   cgraph_edge *create_edge (cgraph_node *caller, cgraph_node *callee,
+ 			    gcall *call_stmt, gcov_type count, int freq,
+-			    bool indir_unknown_callee);
++			    bool indir_unknown_callee, location_t call_location);
+ 
+   /* Put the edge onto the free list.  */
+   void free_edge (cgraph_edge *e);
+diff -ruN gcc-5.4.0-clean/gcc/cgraphunit.c gcc-5.4.0-cdepn/gcc/cgraphunit.c
+--- gcc-5.4.0-clean/gcc/cgraphunit.c	2015-12-16 03:12:06.000000000 -0800
++++ gcc-5.4.0-cdepn/gcc/cgraphunit.c	2017-04-29 15:51:36.159272243 -0700
+@@ -572,6 +572,7 @@
+     DECL_FUNCTION_PERSONALITY (fndecl) = lang_hooks.eh_personality ();
+ }
+ 
++extern int cdepn_dump;
+ /* Analyze the function scheduled to be output.  */
+ void
+ cgraph_node::analyze (void)
+@@ -579,6 +580,10 @@
+   tree decl = this->decl;
+   location_t saved_loc = input_location;
+   input_location = DECL_SOURCE_LOCATION (decl);
++  tree thisTree, calleeTree;
++  FILE *fnref_f;
++  struct cgraph_edge *calleeEdge;
++  expanded_location xloc;
+ 
+   if (thunk.thunk_p)
+     {
+@@ -656,6 +661,36 @@
+   analyzed = true;
+ 
+   input_location = saved_loc;
++
++  if (cdepn_dump) {
++    /* CodeViz: Output information on this node */
++    thisTree = decl;
++    if ((fnref_f = cdepn_open(NULL)))
++      {
++        fprintf(fnref_f,"F {%s} {%s:%d}\n",
++	    lang_hooks.decl_printable_name (thisTree, 2),
++	    DECL_SOURCE_FILE (thisTree), DECL_SOURCE_LINE (thisTree));
++
++      }
++
++    /* CodeViz: Output information on all functions this node calls */
++    for (calleeEdge = callees; calleeEdge;
++	 calleeEdge = calleeEdge->next_callee)  {
++      calleeTree = calleeEdge->callee->decl;
++      if (thisTree != NULL &&
++	  calleeTree != NULL &&
++	  (fnref_f = cdepn_open(NULL)) != NULL)
++	{
++	  xloc = expand_location(calleeEdge->call_location);
++	  fprintf(fnref_f, "C {%s} {%s:%d} {%s}\n",
++	      lang_hooks.decl_printable_name (thisTree, 2),
++	      xloc.file, xloc.line,
++	      lang_hooks.decl_printable_name (calleeTree, 2));
++	}
++      else
++	printf("CODEVIZ: Unexpected NULL encountered\n");
++    }
++  }
+ }
+ 
+ /* C++ frontend produce same body aliases all over the place, even before PCH
+diff -ruN gcc-5.4.0-clean/gcc/toplev.c gcc-5.4.0-cdepn/gcc/toplev.c
+--- gcc-5.4.0-clean/gcc/toplev.c	2015-07-10 05:33:28.000000000 -0700
++++ gcc-5.4.0-cdepn/gcc/toplev.c	2017-04-29 16:13:21.805942292 -0700
+@@ -2102,6 +2102,53 @@
+   timevar_start (TV_TOTAL);
+ }
+ 
++/*
++ * codeviz: Open the cdepn file. This is called with a filename by main()
++ * and with just NULL for every other instance to return just the handle
++ */
++FILE *g_fnref_f = NULL;
++char cdepnfile[256] = "--wonthappen--";
++int cdepn_dump = 0;
++
++FILE *cdepn_open(const char *filename) {
++  struct stat cdepnstat;
++  int errval;
++  time_t currtime;
++  if (filename && g_fnref_f == NULL) {
++    strcpy(cdepnfile, filename);
++    strcat(cdepnfile, ".cdepn");
++
++    /*
++     * Decide whether to open write or append. There appears to be a weird
++     * bug that decides to open the file twice, overwriting all the cdepn
++     * information put there before
++     */
++    errval = stat(cdepnfile, &cdepnstat);
++    currtime = time(NULL);
++    if (errval == -1 || currtime - cdepnstat.st_mtime > 5)  {
++      g_fnref_f = fopen(cdepnfile, "w");
++      fprintf(stderr, "opened dep file %s\n",cdepnfile);
++    } else {
++      g_fnref_f = fopen(cdepnfile, "a");
++      fprintf(stderr, "append dep file %s\n",cdepnfile);
++    }
++
++    fflush(stderr);
++  }
++
++  return g_fnref_f;
++}
++
++void cdepn_close(void) {
++  if (g_fnref_f) fclose(g_fnref_f);
++  g_fnref_f = NULL;
++}
++
++int cdepn_checkprint(void *fncheck) {
++  return 1;
++  /*return (void *)fncheck == (void *)decl_name; */
++}
++
+ /* Entry point of cc1, cc1plus, jc1, f771, etc.
+    Exit code is FATAL_EXIT_CODE if can't open files or if there were
+    any errors, or SUCCESS_EXIT_CODE if compilation succeeded.
+@@ -2162,7 +2209,12 @@
+     {
+       if (m_use_TV_TOTAL)
+ 	start_timevars ();
++      cdepn_dump = ((getenv("CDEPN_SUPPRESS")) ? 0 : 1);
++      if (cdepn_dump)
++         cdepn_open(main_input_filename);
+       do_compile ();
++      if (cdepn_dump)
++         cdepn_close();
+     }
+ 
+   if (warningcount || errorcount || werrorcount)
+diff -ruN gcc-5.4.0-clean/gcc/tree.h gcc-5.4.0-cdepn/gcc/tree.h
+--- gcc-5.4.0-clean/gcc/tree.h	2015-08-05 04:20:59.000000000 -0700
++++ gcc-5.4.0-cdepn/gcc/tree.h	2017-04-29 16:13:43.586162223 -0700
+@@ -5084,4 +5084,11 @@
+ extern void gt_pch_nx (tree &);
+ extern void gt_pch_nx (tree &, gt_pointer_operator, void *);
+ 
++/*
++ * CodeViz functions to get the output file handle for cdepn files
++ */
++FILE *cdepn_open(const char *filename);
++void cdepn_close(void);
++int  cdepn_checkprint(void *fncheck);
++
+ #endif  /* GCC_TREE_H  */
